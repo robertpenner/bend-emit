@@ -326,7 +326,7 @@ export function bundle(core: string): string {
 // def to `be$<i>`; bend never writes a name starting with `be$`, so they cannot
 // collide. Each def is exported under its own name.
 //
-// bend 2.0.38 writes the statement straight after the closing brace of the
+// bend 2.0.39 writes the statement straight after the closing brace of the
 // module's last function when that function is a lifted closure, as
 // `}export default {` on one line (a def that passes a lambda, such as
 // `l => f(t, l)`, ends the module so). It is put on a line of its own first.

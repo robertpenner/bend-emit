@@ -25,7 +25,7 @@
 export interface Native { name: string }
 export interface Skipped { name: string; reason: string }
 
-// The body bend 2.0.38 emits for Base's String.order.go, compared line by line
+// The body bend 2.0.39 emits for Base's String.order.go, compared line by line
 // with blanks trimmed.
 const ORDER_GO_EXPECTED = [
   "for (;;) {",

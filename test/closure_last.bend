@@ -1,7 +1,7 @@
 import Base
 
 # A def that passes a lambda: bend lifts the lambda into a function written
-# last in the module, and 2.0.38 closes that function with
+# last in the module, and 2.0.39 closes that function with
 # `}export default {` on one line. The module must still be read and load.
 
 # Count it when it fits, and walk on with what is left.

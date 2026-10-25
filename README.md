@@ -9,7 +9,7 @@ optimizations to Bend's JavaScript output.
 
 ## Quick Start
 
-Install **Bend 2.0.38** and **Bun**, with both `bend` and `bun` on PATH.
+Install **Bend 2.0.39** and **Bun**, with both `bend` and `bun` on PATH.
 The commands below also require Node.js and npm for `npx`.
 Installing this npm package does not install Bend or Bun.
 
@@ -194,7 +194,7 @@ Template definitions are not exported by Bend's ES-module target.
 
 ## Toolchain Requirements
 
-The build tool requires Bun and **exactly Bend 2.0.38**, the version recorded
+The build tool requires Bun and **exactly Bend 2.0.39**, the version recorded
 in `BEND_VERSION`. Another Bend version is rejected before compilation.
 
 The emitter reads and transforms compiler output, so a different compiler
