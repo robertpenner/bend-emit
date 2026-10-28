@@ -164,15 +164,17 @@ definitions beside its laws, can be built directly. bend-emit builds a copy of
 the file, and of every `.bend` file it imports, without:
 
 - every `law`;
-- every def whose header line contains `==` (a lemma), and every def named
+- every def whose complete header contains `==` (a lemma), and every def named
   like a law (its proof);
 - every def or type that names a skipped one, directly or through an import
   alias such as `KF.lemma`;
 - every `import bend-mathlib...` line.
 
-What remains is emitted as usual. A lemma whose `==` is not on the def's
-header line is not recognized. A file with nothing to skip is built from its
-own path, exactly as before.
+What remains is emitted as usual. Definition headers may span lines; both
+lemma detection and declaration parsing read through the final header colon,
+ignoring comments. Nested function and lambda arrows do not end a parameter
+list or generic type. A file with nothing to skip is built from its own path,
+exactly as before.
 
 In such a build, a def with no TypeScript encoding (for example one whose type
 is a Base type such as `Cmp`) stays in the `.mjs` and is left out of the

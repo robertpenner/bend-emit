@@ -34,6 +34,7 @@ import { loopify, type Stayed } from "./loops";
 import { lazySelect } from "./select";
 import { classify } from "./classes";
 import { runtimeTree } from "./laws";
+import { definitionHeader } from "./header";
 import { peel, type Kept, type Peeled } from "./strpeel";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
@@ -108,14 +109,24 @@ export function readDecls(src: string): { datas: Data[]; defs: Def[] } {
       }
       datas.push({ name: m[1], tparams, ctors });
     } else if (line.startsWith("def ")) {
-      const m = line.match(/^def ([A-Za-z_][\w.]*)\((.*)\) -> (.*):\s*$/);
+      const header = definitionHeader(lines, i);
+      i = header.end;
+      const m = header.text.match(/^def ([A-Za-z_][\w.]*)\(/);
       if (!m) fail(`a def header this tool cannot read: ${line}`);
-      const raw = splitTop(m[2]).map(nameType);
+      let depth = 1;
+      let close = m[0].length;
+      for (; close < header.text.length; close++) {
+        if (header.text[close] === "(") depth++;
+        if (header.text[close] === ")" && --depth === 0) break;
+      }
+      const result = header.text.slice(close + 1).match(/^\s*->\s*(.*):\s*$/);
+      if (!result) fail(`a def header this tool cannot read: ${line}`);
+      const raw = splitTop(header.text.slice(m[0].length, close)).map(nameType);
       // An erased parameter (-A) has no runtime position this tool can vouch
       // for; such a def is kept out of the module (see `hostable`).
       const erased = raw.some(([n]) => n.startsWith("-"));
       const params = raw.map(([n, t]): [string, string] => [n.replace(/^[+-]/, ""), t]);
-      defs.push({ name: m[1], params, ret: m[3].trim(), erased });
+      defs.push({ name: m[1], params, ret: result[1].trim(), erased });
     }
   }
   return { datas, defs };
