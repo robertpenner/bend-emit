@@ -98,16 +98,20 @@ names and compiled export names agree before writing the output.
 
 Supported types follow Bend's runtime representation:
 
-| Bend | JavaScript / TypeScript |
-| --- | --- |
-| `Nat` | `number`: a whole number from 0 to 2^53 |
-| `U32` | `number` |
-| `Bool` | `boolean` |
-| `String` | `string` |
-| `Char` | `string` containing one code point |
+| Bend     | JavaScript / TypeScript                                       |
+| -------- | ------------------------------------------------------------- |
+| `Nat`    | `number`: a whole number from 0 to 2^53                       |
+| `U32`    | `number`                                                      |
+| `Bool`   | `boolean`                                                     |
+| `String` | `string`                                                      |
+| `Char`   | `string` containing one code point                            |
 | `Map<A>` | `BendMap<A>`: a tagged tree with `MTip`, `MLeaf`, and `MNode` |
 
 The generated declaration preamble defines `BendList`, `BendMap`, `BendMaybe`, `BendResult`, and `BendEither` using the runtime's tagged constructors. A `BendMap` is not a native JavaScript `Map`; its `MNode.pos` field is a `number`, like Bend's `Nat` representation. The map's structural invariants are those of the Bend `Map` implementation; bend-emit only describes its runtime shape.
+
+Reusable types such as `+List<Nat>` have the same generated TypeScript shape as
+their contents, in this case `BendList<number>`. Data constructor fields may span
+multiple lines, including comments between fields.
 
 Qualified datatype names use underscores in TypeScript: `Geometry.Point`
 becomes `Geometry_Point`, or `G_Geometry_Point` when imported as `G`.
