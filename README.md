@@ -109,6 +109,11 @@ Supported types follow Bend's runtime representation:
 
 The generated declaration preamble defines `BendList`, `BendMap`, `BendMaybe`, `BendResult`, and `BendEither` using the runtime's tagged constructors. A `BendMap` is not a native JavaScript `Map`; its `MNode.pos` field is a `number`, like Bend's `Nat` representation. The map's structural invariants are those of the Bend `Map` implementation; bend-emit only describes its runtime shape.
 
+Qualified datatype names use underscores in TypeScript: `Geometry.Point`
+becomes `Geometry_Point`, or `G_Geometry_Point` when imported as `G`.
+Constructor tags stay unchanged. A collision with another generated type name
+is rejected explicitly.
+
 ### Runtime Transformations
 
 The generated module is not byte-for-byte identical to Bend's output.

@@ -223,6 +223,7 @@ const RESERVED = new Set([
   "with", "yield", "arguments", "eval",
 ]);
 const bindable = (n: string) => IDENT.test(n) && !RESERVED.has(n);
+const typeName = (prefix: string, name: string) => prefix + name.replace(/\./g, "_");
 
 // A module's data types, with the scope its own fields are read in: its own
 // types, and those of the modules it imports, by the alias it gives them.
@@ -234,13 +235,13 @@ export function modules(path: string, prefix = "", seen = new Set<string>()): Mo
   const src = readFileSync(path, "utf8");
   const { datas } = readDecls(src);
   const scope = new Map<string, string>();
-  for (const d of datas) scope.set(d.name, prefix + d.name);
+  for (const d of datas) scope.set(d.name, typeName(prefix, d.name));
   const out: Module[] = [];
   for (const m of src.matchAll(/^import (\.{1,2}\/\S+\.bend) as ([A-Za-z_]\w*)\s*$/gm)) {
     const dep = resolve(dirname(path), m[1]);
     const depPrefix = `${prefix}${m[2]}_`;
     const sub = modules(dep, depPrefix, seen);
-    for (const d of sub[0].datas) scope.set(`${m[2]}.${d.name}`, depPrefix + d.name);
+    for (const d of sub[0].datas) scope.set(`${m[2]}.${d.name}`, typeName(depPrefix, d.name));
     if (!seen.has(dep + depPrefix)) {
       seen.add(dep + depPrefix);
       out.push(...sub);
@@ -254,7 +255,7 @@ export function declarations(mods: Module[], defs: Def[], undeclared?: string[])
   const written = new Map<string, string>();
   for (const { prefix, datas, scope } of mods) {
     for (const d of datas) {
-      const name = prefix + d.name;
+      const name = typeName(prefix, d.name);
       if (!IDENT.test(name)) fail(`type ${d.name}: not a TypeScript identifier`);
       if (PREAMBLE_TYPES.has(name)) fail(`type ${d.name}: the name of a type bend-emit declares for Base (${[...PREAMBLE_TYPES].join(", ")}); rename it`);
       // An import is written <alias>_<Type>, which a local type or another
