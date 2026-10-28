@@ -361,8 +361,8 @@ export function exportsOf(raw: string, names: string[]): string {
 }
 
 // The export-name prefixes of every .bend file a core reaches, transitively.
-// bend names an imported def by the import path as written in the file that
-// imports it, with "./" dropped, then ":": "../keys/core:" from comp,
+// bend names an imported def by its path relative to the entry module,
+// with "./" dropped, then ":": "../keys/core:" from comp,
 // "generics:" for "./generics.bend". (Through bend 2.0.37 the separator was ".".)
 //
 // A constructor's tag needs no such care: since 2.0.38 bend tags it with its
@@ -438,9 +438,9 @@ async function buildCore(core: string, outDir: string, lenient: boolean): Promis
   const mod = (await import(jsPath + "?t=" + Date.now())).default as Record<string, unknown>;
   // The module also carries the defs of every .bend file the core reaches,
   // directly or through another import; those are theirs. Each is named by
-  // its import path as written in the file that imports it
+  // its path relative to the entry module
   // ("../schema-lib/core:check", or "generics:first_big" for
-  // "./generics.bend"), so the prefixes are collected file by file.
+  // "./generics.bend"), including transitive imports.
   const imported = [...importPrefixes(core)];
   const have = Object.keys(mod).filter((k) => !imported.some((p) => k.startsWith(p))).sort();
   const want = [...names].sort();
