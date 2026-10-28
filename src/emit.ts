@@ -368,12 +368,13 @@ export function exportsOf(raw: string, names: string[]): string {
 // A constructor's tag needs no such care: since 2.0.38 bend tags it with its
 // name in the file that declares it ("TooBig", not "generics.TooBig"), which is
 // the name the .d.mts and every host that builds values by hand speak.
-export function importPrefixes(path: string, seen = new Set<string>(), out = new Set<string>()): Set<string> {
+export function importPrefixes(path: string, seen = new Set<string>(), out = new Set<string>(), root = dirname(path)): Set<string> {
   if (seen.has(path)) return out;
   seen.add(path);
   for (const m of readFileSync(path, "utf8").matchAll(/^import (\.{1,2}\/\S+)\.bend as \w+\s*$/gm)) {
-    out.add(m[1].replace(/^\.\//, "") + ":");
-    importPrefixes(resolve(dirname(path), m[1] + ".bend"), seen, out);
+    const dependency = resolve(dirname(path), m[1] + ".bend");
+    out.add(relative(root, dependency).replace(/\\/g, "/").replace(/\.bend$/, "") + ":");
+    importPrefixes(dependency, seen, out, root);
   }
   return out;
 }
