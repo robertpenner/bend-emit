@@ -34,6 +34,7 @@ import { loopify, type Stayed } from "./loops";
 import { lazySelect } from "./select";
 import { classify } from "./classes";
 import { runtimeTree } from "./laws";
+import { definitionHeader } from "./header";
 import { peel, type Kept, type Peeled } from "./strpeel";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
@@ -108,14 +109,24 @@ export function readDecls(src: string): { datas: Data[]; defs: Def[] } {
       }
       datas.push({ name: m[1], tparams, ctors });
     } else if (line.startsWith("def ")) {
-      const m = line.match(/^def ([A-Za-z_][\w.]*)\((.*)\) -> (.*):\s*$/);
+      const header = definitionHeader(lines, i);
+      i = header.end;
+      const m = header.text.match(/^def ([A-Za-z_][\w.]*)\(/);
       if (!m) fail(`a def header this tool cannot read: ${line}`);
-      const raw = splitTop(m[2]).map(nameType);
+      let depth = 1;
+      let close = m[0].length;
+      for (; close < header.text.length; close++) {
+        if (header.text[close] === "(") depth++;
+        if (header.text[close] === ")" && --depth === 0) break;
+      }
+      const result = header.text.slice(close + 1).match(/^\s*->\s*(.*):\s*$/);
+      if (!result) fail(`a def header this tool cannot read: ${line}`);
+      const raw = splitTop(header.text.slice(m[0].length, close)).map(nameType);
       // An erased parameter (-A) has no runtime position this tool can vouch
       // for; such a def is kept out of the module (see `hostable`).
       const erased = raw.some(([n]) => n.startsWith("-"));
       const params = raw.map(([n, t]): [string, string] => [n.replace(/^[+-]/, ""), t]);
-      defs.push({ name: m[1], params, ret: m[3].trim(), erased });
+      defs.push({ name: m[1], params, ret: result[1].trim(), erased });
     }
   }
   return { datas, defs };
@@ -212,6 +223,7 @@ const RESERVED = new Set([
   "with", "yield", "arguments", "eval",
 ]);
 const bindable = (n: string) => IDENT.test(n) && !RESERVED.has(n);
+const typeName = (prefix: string, name: string) => prefix + name.replace(/\./g, "_");
 
 // A module's data types, with the scope its own fields are read in: its own
 // types, and those of the modules it imports, by the alias it gives them.
@@ -223,13 +235,13 @@ export function modules(path: string, prefix = "", seen = new Set<string>()): Mo
   const src = readFileSync(path, "utf8");
   const { datas } = readDecls(src);
   const scope = new Map<string, string>();
-  for (const d of datas) scope.set(d.name, prefix + d.name);
+  for (const d of datas) scope.set(d.name, typeName(prefix, d.name));
   const out: Module[] = [];
   for (const m of src.matchAll(/^import (\.{1,2}\/\S+\.bend) as ([A-Za-z_]\w*)\s*$/gm)) {
     const dep = resolve(dirname(path), m[1]);
     const depPrefix = `${prefix}${m[2]}_`;
     const sub = modules(dep, depPrefix, seen);
-    for (const d of sub[0].datas) scope.set(`${m[2]}.${d.name}`, depPrefix + d.name);
+    for (const d of sub[0].datas) scope.set(`${m[2]}.${d.name}`, typeName(depPrefix, d.name));
     if (!seen.has(dep + depPrefix)) {
       seen.add(dep + depPrefix);
       out.push(...sub);
@@ -243,7 +255,7 @@ export function declarations(mods: Module[], defs: Def[], undeclared?: string[])
   const written = new Map<string, string>();
   for (const { prefix, datas, scope } of mods) {
     for (const d of datas) {
-      const name = prefix + d.name;
+      const name = typeName(prefix, d.name);
       if (!IDENT.test(name)) fail(`type ${d.name}: not a TypeScript identifier`);
       if (PREAMBLE_TYPES.has(name)) fail(`type ${d.name}: the name of a type bend-emit declares for Base (${[...PREAMBLE_TYPES].join(", ")}); rename it`);
       // An import is written <alias>_<Type>, which a local type or another
@@ -349,19 +361,20 @@ export function exportsOf(raw: string, names: string[]): string {
 }
 
 // The export-name prefixes of every .bend file a core reaches, transitively.
-// bend names an imported def by the import path as written in the file that
-// imports it, with "./" dropped, then ":": "../keys/core:" from comp,
+// bend names an imported def by its path relative to the entry module,
+// with "./" dropped, then ":": "../keys/core:" from comp,
 // "generics:" for "./generics.bend". (Through bend 2.0.37 the separator was ".".)
 //
 // A constructor's tag needs no such care: since 2.0.38 bend tags it with its
 // name in the file that declares it ("TooBig", not "generics.TooBig"), which is
 // the name the .d.mts and every host that builds values by hand speak.
-export function importPrefixes(path: string, seen = new Set<string>(), out = new Set<string>()): Set<string> {
+export function importPrefixes(path: string, seen = new Set<string>(), out = new Set<string>(), root = dirname(path)): Set<string> {
   if (seen.has(path)) return out;
   seen.add(path);
   for (const m of readFileSync(path, "utf8").matchAll(/^import (\.{1,2}\/\S+)\.bend as \w+\s*$/gm)) {
-    out.add(m[1].replace(/^\.\//, "") + ":");
-    importPrefixes(resolve(dirname(path), m[1] + ".bend"), seen, out);
+    const dependency = resolve(dirname(path), m[1] + ".bend");
+    out.add(relative(root, dependency).replace(/\\/g, "/").replace(/\.bend$/, "") + ":");
+    importPrefixes(dependency, seen, out, root);
   }
   return out;
 }
@@ -425,9 +438,9 @@ async function buildCore(core: string, outDir: string, lenient: boolean): Promis
   const mod = (await import(jsPath + "?t=" + Date.now())).default as Record<string, unknown>;
   // The module also carries the defs of every .bend file the core reaches,
   // directly or through another import; those are theirs. Each is named by
-  // its import path as written in the file that imports it
+  // its path relative to the entry module
   // ("../schema-lib/core:check", or "generics:first_big" for
-  // "./generics.bend"), so the prefixes are collected file by file.
+  // "./generics.bend"), including transitive imports.
   const imported = [...importPrefixes(core)];
   const have = Object.keys(mod).filter((k) => !imported.some((p) => k.startsWith(p))).sort();
   const want = [...names].sort();

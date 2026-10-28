@@ -15,6 +15,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import { definitionHeader } from "./header";
 
 const IMPORT = /^import (\.{1,2}\/\S+\.bend) as ([A-Za-z_]\w*)\s*$/gm;
 const nameOf = (b: string) => b.match(/^(?:law|def|type) ([\w.']+)/)?.[1];
@@ -30,7 +31,7 @@ function strip(text: string, foreign: Set<string>): { text: string; skipped: Set
   const live = blocks.filter((b) => !b.startsWith("law "));
   for (const b of live) {
     const n = nameOf(b);
-    if (b.startsWith("def ") && n && (laws.has(n) || b.split("\n")[0].includes("=="))) gone.add(n);
+    if (b.startsWith("def ") && n && (laws.has(n) || definitionHeader(b.split("\n"), 0).text.includes("=="))) gone.add(n);
   }
   // A def or type that names a skipped one is skipped, until nothing changes.
   for (let more = true; more; ) {
