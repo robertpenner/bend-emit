@@ -101,10 +101,20 @@ export function readDecls(src: string): { datas: Data[]; defs: Def[] } {
       while (end + 1 < lines.length && body(lines[end + 1])) end++;
       while (end > i && /^\s*$/.test(lines[end])) end--;
       for (; i < end; i++) {
-        const text = lines[i + 1].trim();
-        if (text === "" || text.startsWith("#")) continue;
+        const first = lines[i + 1];
+        let text = first.replace(/#.*$/, "").trim();
+        if (text === "") continue;
+        const balance = (s: string) => (s.match(/\{/g)?.length ?? 0) - (s.match(/\}/g)?.length ?? 0);
+        let depth = balance(text);
+        while (depth > 0 && i + 1 < end) {
+          i++;
+          const next = lines[i + 1].replace(/#.*$/, "").trim();
+          text += " " + next;
+          depth += balance(next);
+        }
+        if (depth > 0) fail(`unterminated constructor of ${m[1]}: ${first}`);
         const c = text.match(/^([A-Za-z_]\w*)\{(.*)\}$/);
-        if (!c) fail(`a constructor of ${m[1]} is not Name{field: Type, ...}: ${lines[i + 1]}`);
+        if (!c) fail(`a constructor of ${m[1]} is not Name{field: Type, ...}: ${first}`);
         ctors.push({ name: c[1], fields: splitTop(c[2]).map(nameType) });
       }
       datas.push({ name: m[1], tparams, ctors });
@@ -177,6 +187,7 @@ const PREAMBLE_TYPES = new Set(PREAMBLE.map((l) => l.match(/^export type (\w+)/)
 // A Bend type as the runtime encodes it. `scope` maps a data type's name, as
 // the module that uses it writes it, to its TypeScript name.
 function tsType(t: string, datas: Map<string, string>, where: string): string {
+  if (t.startsWith("+")) return tsType(t.slice(1).trim(), datas, where);
   if (t === "Nat") return "number";
   if (t === "Bool") return "boolean";
   if (t === "String") return "string";
