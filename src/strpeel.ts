@@ -1,6 +1,6 @@
 // strpeel.ts: carry a string that is only ever peeled at its head as (string, index).
 //
-// bend (2.0.39) emits a match on SCon{c, t} over a string as
+// bend (2.0.40) emits a match on SCon{c, t} over a string as
 //
 //   if (S === "") {...} else {
 //     const C = S.slice(0, char_len(S));   // head
@@ -14,14 +14,14 @@
 // the head, the tail is never needed as a string. It is carried as an index: the
 // string parameter stays the same object, and a hidden trailing parameter `be$i<P>`
 // (default 0, so every outside caller is unchanged) says where the logical string
-// starts, and the head and the step read char_len(S, i) there. Two shapes are
-// handled:
+// starts, and the head and the step are read there. Two shapes are handled:
 //
 //   reader   function f(.., P, ..)  where every use of P is `P === ""` or the head
 //            expression. Gets a trailing `be$iP = 0`.
 //   walker   the for(;;) def of loops.ts / bend, whose parameter `$k` is read once
-//            per step as `const P = $k;`, and whose tail T is only assigned back
-//            to `$k` or passed to a reader.
+//            per step as `const P = $k;`, and each of whose tails (a match under
+//            another binds the tail once per arm) is a const only assigned
+//            back to `$k` or passed to a reader.
 //
 // Anything else is left as bend wrote it (the tail is materialised, as before),
 // and reported. The tail is never materialised behind the caller's back: if a
@@ -29,6 +29,12 @@
 // the text this bend version emits: when they change, nothing matches and the
 // pass does nothing, so test/peel.bend holds both shapes and the gate fails then.
 // A module without the runtime's char_len(s, at) is left alone, and reported.
+//
+// The head and the step at i go through two helpers the pass adds after the
+// runtime's char_len, be$head(S, i) and be$next(S, i). A UTF-16 unit that is not
+// a surrogate is a whole Char, so they read it without calling char_len; a
+// surrogate (an astral pair, a lone surrogate, or the U+DC00 of a packed Char)
+// goes to char_len(S, i) as before. bend never writes a name starting with be$.
 
 import { close, occ, splitTop } from "./loops";
 
@@ -39,8 +45,22 @@ const esc = (s: string) => s.replace(/[$.*+?^{}()|[\]\\]/g, "\\$&");
 const headOf = (p: string) => `${p}.slice(0, char_len(${p}))`;
 const tailOf = (p: string) => `${p}.slice(char_len(${p}))`;
 // the same, on the string that starts at index q of p
-const headAt = (p: string, q: string) => `${p}.slice(${q}, ${q} + char_len(${p}, ${q}))`;
-const nextAt = (p: string, q: string) => `${q} + char_len(${p}, ${q})`;
+const headAt = (p: string, q: string) => `be$head(${p}, ${q})`;
+const nextAt = (p: string, q: string) => `be$next(${p}, ${q})`;
+
+const HELPERS = [
+  "function be$head(be$s, be$i) {",
+  "  // bend-emit: the Char at index be$i of be$s; a unit that is not a surrogate is one.",
+  "  const be$c = be$s.charCodeAt(be$i);",
+  "  return be$c < 0xD800 || be$c >= 0xE000 ? be$s[be$i] : be$s.slice(be$i, be$i + char_len(be$s, be$i));",
+  "}",
+  "",
+  "function be$next(be$s, be$i) {",
+  "  // bend-emit: the index after the Char at index be$i of be$s.",
+  "  const be$c = be$s.charCodeAt(be$i);",
+  "  return be$c < 0xD800 || be$c >= 0xE000 ? be$i + 1 : be$i + char_len(be$s, be$i);",
+  "}",
+].join("\n");
 const idRe = (n: string) => new RegExp("(?<![\\w$])" + esc(n) + "(?![\\w$])", "g");
 const ix = (n: string) => "be$i" + n;
 const count = (s: string, sub: string) => s.split(sub).length - 1;
@@ -50,6 +70,28 @@ function stray(body: string, p: string, idioms: string[]): number {
   let b = body;
   for (const i of idioms) b = b.split(i).join("");
   return occ(b, p);
+}
+
+// `text` with each call that hands a tail to a reader in a peeled position
+// rewritten to hand it the string and, after its arguments, the tail's index.
+function toReaders(text: string, readers: Map<string, number[]>, tails: Set<string>, p: string): string {
+  for (const [f, pos] of readers) {
+    const re = new RegExp("(?<![\\w$])" + esc(f) + "\\(", "g");
+    let res = "", last = 0;
+    for (let m; (m = re.exec(text)); ) {
+      const o = m.index + f.length, e = close(text, o);
+      if (e < 0) continue;
+      const args = splitTop(text.slice(o + 1, e));
+      if (!pos.some((k) => tails.has(args[k]))) continue;
+      const extra = pos.map((k) => (tails.has(args[k]) ? ix(args[k]) : "0"));
+      const a2 = args.map((x, i) => (pos.includes(i) && tails.has(x) ? p : x));
+      res += text.slice(last, o + 1) + [...a2, ...extra].join(", ") + ")";
+      last = e + 1;
+      re.lastIndex = e + 1;
+    }
+    text = res + text.slice(last);
+  }
+  return text;
 }
 
 export function peel(js: string): { js: string; peeled: Peeled[]; kept: Kept[] } {
@@ -98,58 +140,25 @@ export function peel(js: string): { js: string; peeled: Peeled[]; kept: Kept[] }
       // the parameter itself: read once, otherwise only assigned
       const assigns = [...b.matchAll(new RegExp("^(\\s*)" + esc(v) + " = ([^\\n]*);$", "gm"))];
       if (occ(b, v) !== 1 + assigns.length) return fail("parameter used other than as its per-step alias and assignments");
-      const tm = b.match(new RegExp("^(\\s*)const (_\\w+) = " + esc(tailOf(P)) + ";$", "m"));
-      if (!tm) return; // no tail: nothing to save here
-      const T = tm[2];
+      // every tail of the string: a match under another match binds the tail once per arm
+      const tailRe = new RegExp("^(\\s*)const ([\\w$]+) = " + esc(tailOf(P)) + ";$", "gm");
+      const tails = new Set([...b.matchAll(tailRe)].map((m) => m[2]));
+      if (!tails.size) return; // no tail: nothing to save here
       if (stray(b, P, [`${P} === ""`, headOf(P), tailOf(P)]) !== 1) return fail("string is used other than by test, head and tail");
-      // every use of T: `$k = T;` or a reader argument
-      let t = b.replace(tm[0], "");
-      // rewrite reader calls whose peel position holds T
-      let rest = t;
-      for (const [f, pos] of readers) {
-        const re = new RegExp("(?<![\\w$])" + esc(f) + "\\(", "g");
-        let res = "", last = 0;
-        for (let m; (m = re.exec(rest)); ) {
-          const o = m.index + f.length, e = close(rest, o);
-          if (e < 0) continue;
-          const args = splitTop(rest.slice(o + 1, e));
-          if (!pos.some((p) => args[p] === T)) continue;
-          const extra = pos.map((p) => (args[p] === T ? ix(T) : "0"));
-          const a2 = args.map((a, i) => (pos.includes(i) && a === T ? P : a));
-          res += rest.slice(last, o + 1) + [...a2, ...extra].join(", ") + ")";
-          last = e + 1;
-          re.lastIndex = e + 1;
-        }
-        rest = res + rest.slice(last);
-      }
-      // what is left of T must be `$k = T;`
-      const own = new RegExp("^\\s*" + esc(v) + " = " + esc(T) + ";$", "gm");
-      const restNoOwn = rest.replace(own, "");
-      if (occ(restNoOwn, T) !== 0) return fail("tail is used other than as the next step or a head-only reader's argument");
+      // a tail that is not bound to a name would stay a slice of the whole string
+      if (count(b.replace(tailRe, ""), tailOf(P)) !== 0) return fail("tail is taken other than as a const");
+      // every use of a tail: `$k = T;` or a reader argument
+      const own = new RegExp("^\\s*" + esc(v) + " = ([\\w$]+);$", "gm");
+      const left = toReaders(b.replace(tailRe, ""), readers, tails, P).replace(own, (w, x: string) => (tails.has(x) ? "" : w));
+      if ([...tails].some((T) => occ(left, T) !== 0)) return fail("tail is used other than as the next step or a head-only reader's argument");
       if (!helper) return fail(noHelper);
       // commit
       let r = b;
       r = r.replace(al[0], `${al[1]}const ${P} = ${v};\n${al[1]}const ${Pi} = ${vi};`);
-      r = r.replace(tm[0], `${tm[1]}const ${ix(T)} = ${nextAt(P, Pi)};`);
-      // reader calls, on r
-      for (const [f, pos] of readers) {
-        const re = new RegExp("(?<![\\w$])" + esc(f) + "\\(", "g");
-        let res = "", last = 0;
-        for (let m; (m = re.exec(r)); ) {
-          const o = m.index + f.length, e = close(r, o);
-          if (e < 0) continue;
-          const args = splitTop(r.slice(o + 1, e));
-          if (!pos.some((p) => args[p] === T)) continue;
-          const extra = pos.map((p) => (args[p] === T ? ix(T) : "0"));
-          const a2 = args.map((a, i) => (pos.includes(i) && a === T ? P : a));
-          res += r.slice(last, o + 1) + [...a2, ...extra].join(", ") + ")";
-          last = e + 1;
-          re.lastIndex = e + 1;
-        }
-        r = res + r.slice(last);
-      }
+      r = r.replace(tailRe, (_w, ind: string, T: string) => `${ind}const ${ix(T)} = ${nextAt(P, Pi)};`);
+      r = toReaders(r, readers, tails, P);
       r = r.replace(new RegExp("^(\\s*)" + esc(v) + " = ([^\\n]*);$", "gm"), (_w, ind: string, x: string) =>
-        x === T ? `${ind}${vi} = ${ix(T)};` : `${ind}${v} = ${x}; ${vi} = 0;`);
+        tails.has(x) ? `${ind}${vi} = ${ix(x)};` : `${ind}${v} = ${x}; ${vi} = 0;`);
       r = r.split(`${P} === ""`).join(`${Pi} >= ${P}.length`).split(headOf(P)).join(headAt(P, Pi));
       b = r;
       np.push(`${vi} = 0`);
@@ -158,5 +167,7 @@ export function peel(js: string): { js: string; peeled: Peeled[]; kept: Kept[] }
     if (np.length === params.length) return whole;
     return `function ${name}(${np.join(", ")}) {\n${b}\n}`;
   });
+  // the helpers go after the runtime's char_len, which every peeled def needs
+  if (peeled.length) out = out.replace(/^function char_len\(s, at = 0\) \{\n[\s\S]*?\n\}$/m, (f) => `${f}\n\n${HELPERS}`);
   return { js: out, peeled, kept };
 }
