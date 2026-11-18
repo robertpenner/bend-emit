@@ -63,6 +63,6 @@ type Input is Data:
 def keep(value: Nat) -> Nat:
   value
 `);
-  await expect(build(entry, output)).rejects.toThrow("unterminated constructor of Input");
+  await expect(build(entry, output)).rejects.toThrow("bend could not compile");
   expect(existsSync(output)).toBe(false);
 });

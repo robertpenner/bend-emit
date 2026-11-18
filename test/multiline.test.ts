@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { build, readDecls } from "../src/emit";
+import { build } from "../src/emit";
 
 const root = mkdtempSync(join(process.env.BEND_EMIT_TEST_ARTIFACTS ?? tmpdir(), "multiline-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -47,12 +47,17 @@ def witness() -> Exists(Nat, value => {value == value : Nat}):
   expect(readFileSync(result.dts, "utf8")).not.toContain("witness");
 });
 
-test("nested return-type arrows do not become function parameters", () => {
-  const { defs } = readDecls(`def decide(a: Nat, b: Nat) -> Or(Le(a, b), Le(a, b) -> Empty):
-  TODO
+test("nested return-type arrows do not become function parameters", async () => {
+  const entry = join(root, "nested.bend");
+  writeFileSync(entry, `import Base
+
+def callbacks(a: Nat, b: Nat) -> List<(Nat -> Nat)>:
+  [x => Nat.add(x, Nat.add(a, b))]
 `);
-  expect(defs[0].params).toEqual([["a", "Nat"], ["b", "Nat"]]);
-  expect(defs[0].ret).toBe("Or(Le(a, b), Le(a, b) -> Empty)");
+  const result = await build(entry, join(root, "nested-out"));
+  const module = await import(result.js);
+  expect(module.callbacks(2, 3).head(7)).toBe(12);
+  expect(readFileSync(result.dts, "utf8")).toContain("callbacks(a: number, b: number): BendList<");
 });
 
 test("multiline runtime headers retain their types and ignore comment equations", async () => {
@@ -72,10 +77,15 @@ def add(
   expect(readFileSync(result.dts, "utf8")).toContain("add(a: number, b: number): number");
 });
 
-test("an unterminated header cannot consume the next declaration", () => {
-  expect(() => readDecls(`def broken(value: Nat) -> Nat
+test("an unterminated header cannot consume the next declaration", async () => {
+  const entry = join(root, "broken.bend");
+  const out = join(root, "broken-out");
+  writeFileSync(entry, `import Base
+def broken(value: Nat) -> Nat
   value
 def keep(value: Nat) -> Nat:
   value
-`)).toThrow("unterminated def header: def broken");
+`);
+  await expect(build(entry, out)).rejects.toThrow("bend could not compile");
+  expect(existsSync(out)).toBe(false);
 });

@@ -10,332 +10,37 @@
 // core.mts then core.d.mts and stopping -- measured with --traceResolution.
 // A .d.ts beside a .mjs is a file no tool ever reads.
 //
-// The JavaScript is bend's own, from bend's ES-module target:
+// The JavaScript is bend's own: its ES-module target, the text
+// `bend <core.bend> -o <out>.mjs` writes, made in this process from bend's own
+// source (see book.ts). It is bend's loader shape, `export default { name: fn,
+// ... }`, and nothing else -- no named exports -- so the tail (see
+// `exportsOf`) binds that object to a name and re-exports each def from it,
+// which is what a host's `import { name }` and the .d.mts need.
 //
-//   bend <core.bend> -o <out>.mjs
-//
-// `bend --help` calls that "an ES module of its non-IO defs, for JS to import",
-// and it is what the build below runs. It writes bend's own loader shape,
-// `export default { name: fn, ... }`, and nothing else -- no named exports --
-// so the tail (see `exportsOf`) binds that object to a name and re-exports each
-// def from it, which is what a host's `import { name }` and the .d.mts need.
-//
-// The types are derived from the .bend source, never written by hand: the
-// `type ... is Data:` blocks and the `def` headers are read, and each Bend type
-// maps to the runtime's own encoding (BEND.md 4.0). A Bend type this file does
-// not know is refused, naming the def -- a guess would be a hand-written type
-// again. The def names read from the source must be exactly the names the
-// compiled module exports, or nothing is written.
+// The types are the checked core's, never written by hand: each def's type and
+// each data type's constructors, as bend's checker holds them, map to the
+// runtime's own encoding (BEND.md 4.0). A Bend type this tool does not know is
+// refused, naming the def -- a guess would be a hand-written type again. The
+// defs declared must be exactly the names the compiled module exports, or
+// nothing is written.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { intrinsics, type Native, type Skipped } from "./intrinsics";
+import { entries, type Entry } from "./entries";
 import { loopify, type Stayed } from "./loops";
 import { lazySelect } from "./select";
+import { lazyArgs, type Reverted } from "./lazy";
 import { classify } from "./classes";
 import { runtimeTree } from "./laws";
-import { definitionHeader } from "./header";
 import { peel, type Kept, type Peeled } from "./strpeel";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { arities, bindable, declarations, exported, fail, javascript, load } from "./book";
+import { basename, join, resolve } from "node:path";
 
-interface Ctor { name: string; fields: [string, string][] }
-interface Data { name: string; tparams: string[]; ctors: Ctor[] }
-interface Def { name: string; params: [string, string][]; ret: string; erased: boolean }
-
-function fail(msg: string): never {
-  throw new Error("bend-emit: " + msg);
-}
-
-// Split on commas that are not inside <...> or {...}.
-function splitTop(s: string): string[] {
-  const out: string[] = [];
-  let depth = 0;
-  let cur = "";
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === "-" && s[i + 1] === ">") {
-      cur += "->"; // an arrow's > is not a closing bracket
-      i++;
-      continue;
-    }
-    if (ch === "<" || ch === "{" || ch === "(") depth++;
-    if (ch === ">" || ch === "}" || ch === ")") depth--;
-    if (ch === "," && depth === 0) {
-      out.push(cur.trim());
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  if (cur.trim() !== "") out.push(cur.trim());
-  return out;
-}
-
-function nameType(s: string): [string, string] {
-  const i = s.indexOf(":");
-  if (i < 0) fail(`no type in "${s}"`);
-  return [s.slice(0, i).trim(), s.slice(i + 1).trim()];
-}
-
-export function readDecls(src: string): { datas: Data[]; defs: Def[] } {
-  const lines = src.split("\n");
-  const datas: Data[] = [];
-  const defs: Def[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith("type ")) {
-      // A type may take type parameters of kind Data: `type Both<A: Data, B: Data> is Data:`.
-      const m = line.match(/^type ([A-Za-z_][\w.]*)(?:<(.*)>)? is Data:\s*$/);
-      if (!m) fail(`only "type X is Data:" or "type X<A: Data, ...> is Data:" is supported: ${line}`);
-      const tparams = m[2] ? splitTop(m[2]).map(nameType).map(([n, k]) => {
-        if (k !== "Data") fail(`type ${m[1]}: a type parameter of kind ${k} (only Data is supported): ${line}`);
-        return n;
-      }) : [];
-      // The body is every indented line up to the next line that is not
-      // indented and not blank. A blank line or a comment inside it is bend's
-      // to allow, so it is skipped; stopping at a blank line would drop the
-      // constructors after it without a word.
-      const ctors: Ctor[] = [];
-      const body = (l: string) => /^\s+\S/.test(l) || /^\s*$/.test(l);
-      let end = i;
-      while (end + 1 < lines.length && body(lines[end + 1])) end++;
-      while (end > i && /^\s*$/.test(lines[end])) end--;
-      for (; i < end; i++) {
-        const first = lines[i + 1];
-        let text = first.replace(/#.*$/, "").trim();
-        if (text === "") continue;
-        const balance = (s: string) => (s.match(/\{/g)?.length ?? 0) - (s.match(/\}/g)?.length ?? 0);
-        let depth = balance(text);
-        while (depth > 0 && i + 1 < end) {
-          i++;
-          const next = lines[i + 1].replace(/#.*$/, "").trim();
-          text += " " + next;
-          depth += balance(next);
-        }
-        if (depth > 0) fail(`unterminated constructor of ${m[1]}: ${first}`);
-        const c = text.match(/^([A-Za-z_]\w*)\{(.*)\}$/);
-        if (!c) fail(`a constructor of ${m[1]} is not Name{field: Type, ...}: ${first}`);
-        ctors.push({ name: c[1], fields: splitTop(c[2]).map(nameType) });
-      }
-      datas.push({ name: m[1], tparams, ctors });
-    } else if (line.startsWith("def ")) {
-      const header = definitionHeader(lines, i);
-      i = header.end;
-      const m = header.text.match(/^def ([A-Za-z_][\w.]*)\(/);
-      if (!m) fail(`a def header this tool cannot read: ${line}`);
-      let depth = 1;
-      let close = m[0].length;
-      for (; close < header.text.length; close++) {
-        if (header.text[close] === "(") depth++;
-        if (header.text[close] === ")" && --depth === 0) break;
-      }
-      const result = header.text.slice(close + 1).match(/^\s*->\s*(.*):\s*$/);
-      if (!result) fail(`a def header this tool cannot read: ${line}`);
-      const raw = splitTop(header.text.slice(m[0].length, close)).map(nameType);
-      // An erased parameter (-A) has no runtime position this tool can vouch
-      // for; such a def is kept out of the module (see `hostable`).
-      const erased = raw.some(([n]) => n.startsWith("-"));
-      const params = raw.map(([n, t]): [string, string] => [n.replace(/^[+-]/, ""), t]);
-      defs.push({ name: m[1], params, ret: result[1].trim(), erased });
-    }
-  }
-  return { datas, defs };
-}
-
-// The index of the first "->" outside <...>, {...} and (...), or -1.
-function topArrow(t: string): number {
-  let depth = 0;
-  for (let i = 0; i < t.length - 1; i++) {
-    const ch = t[i];
-    if (ch === "-" && t[i + 1] === ">") {
-      if (depth === 0) return i;
-      i++; // the > of a nested arrow is not a closing bracket
-      continue;
-    }
-    if (ch === "<" || ch === "{" || ch === "(") depth++;
-    if (ch === ">" || ch === "}" || ch === ")") depth--;
-  }
-  return -1;
-}
-
-// Base's generic types, each with its number of type parameters and the
-// TypeScript type the preamble declares for it (PREAMBLE, below). A Bend use
-// writes either no quantities or one per type parameter, before the types:
-// `List<Nat>`, `List<&2, Nat>`, `Result<&2, &2, Err, Nat>`.
-const GENERICS: Record<string, { params: number; ts: string }> = {
-  List: { params: 1, ts: "BendList" },
-  Map: { params: 1, ts: "BendMap" },
-  Maybe: { params: 1, ts: "BendMaybe" },
-  Result: { params: 2, ts: "BendResult" },
-  Either: { params: 2, ts: "BendEither" },
-};
-
-// Base's types as the runtime encodes them: a constructor's name, and its
-// fields by the names Base gives them.
-const PREAMBLE = [
-  "export type BendList<T> = { $: \"Nil\" } | { $: \"Con\"; head: T; tail: BendList<T> };",
-  "export type BendMap<T> = { $: \"MTip\" } | { $: \"MLeaf\"; key: string; val: T } | { $: \"MNode\"; pos: number; lo: BendMap<T>; hi: BendMap<T> };",
-  "export type BendMaybe<T> = { $: \"None\" } | { $: \"Some\"; value: T };",
-  "export type BendResult<E, A> = { $: \"Fail\"; error: E } | { $: \"Done\"; value: A };",
-  "export type BendEither<A, B> = { $: \"Inl\"; value: A } | { $: \"Inr\"; value: B };",
-  "export type BendUnit = { $: \"Unit\" };",
-];
-// The names the preamble declares. They are public (a host imports them), so a
-// data type of the same name is refused rather than renamed.
-const PREAMBLE_TYPES = new Set(PREAMBLE.map((l) => l.match(/^export type (\w+)/)![1]));
-
-// A Bend type as the runtime encodes it. `scope` maps a data type's name, as
-// the module that uses it writes it, to its TypeScript name.
-function tsType(t: string, datas: Map<string, string>, where: string): string {
-  if (t.startsWith("+")) return tsType(t.slice(1).trim(), datas, where);
-  if (t === "Nat") return "number";
-  if (t === "Bool") return "boolean";
-  if (t === "String") return "string";
-  if (t === "U32") return "number";
-  // A Char is the one-code-point string the runtime makes it (char_new is
-  // String.fromCodePoint; Char.to_u32 is codePointAt(0)).
-  if (t === "Char") return "string";
-  if (t === "Unit") return "BendUnit";
-  // A function type, A -> B, split at its first top-level arrow. The runtime
-  // passes a closure as a plain JS function of one argument.
-  const arrow = topArrow(t);
-  if (arrow >= 0) {
-    return `((x: ${tsType(t.slice(0, arrow).trim(), datas, where)}) => ${tsType(t.slice(arrow + 2).trim(), datas, where)})`;
-  }
-  const app = t.match(/^([A-Za-z_][\w.]*)<(.*)>$/);
-  if (app && !GENERICS[app[1]] && datas.has(app[1])) {
-    return `${datas.get(app[1])}<${splitTop(app[2]).map((a) => tsType(a, datas, where)).join(", ")}>`;
-  }
-  if (app) {
-    const g = GENERICS[app[1]];
-    if (!g) return fail(`${where}: no TypeScript encoding for the generic Bend type ${app[1]} (in ${t})`);
-    const args = splitTop(app[2]);
-    const qs = args.filter((a) => a.startsWith("&")).length;
-    const types = args.slice(qs);
-    if ((qs !== 0 && qs !== g.params) || types.length !== g.params || types.some((a) => a.startsWith("&"))) {
-      fail(`${where}: ${app[1]} takes ${g.params} type(s), after no quantities or one per type: ${t}`);
-    }
-    return `${g.ts}<${types.map((a) => tsType(a, datas, where)).join(", ")}>`;
-  }
-  if (/^[A-Z]$/.test(t) && datas.has("$param:" + t)) return t;
-  const known = datas.get(t);
-  if (known) return known;
-  return fail(`${where}: no TypeScript encoding for the Bend type ${t}`);
-}
-
-const IDENT = /^[A-Za-z_$][\w$]*$/;
-// Words a module cannot bind as a name. A def so named is reached through the
-// default export only, as a def whose name is not an identifier is.
-const RESERVED = new Set([
-  "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do",
-  "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "implements", "import",
-  "in", "instanceof", "interface", "let", "new", "null", "package", "private", "protected", "public",
-  "return", "static", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while",
-  "with", "yield", "arguments", "eval",
-]);
-const bindable = (n: string) => IDENT.test(n) && !RESERVED.has(n);
-const typeName = (prefix: string, name: string) => prefix + name.replace(/\./g, "_");
-
-// A module's data types, with the scope its own fields are read in: its own
-// types, and those of the modules it imports, by the alias it gives them.
-export interface Module { prefix: string; datas: Data[]; scope: Map<string, string> }
-
-// The core and every .bend file it imports, transitively. An imported type
-// A.Name is Name in module A, and A_Name in TypeScript.
-export function modules(path: string, prefix = "", seen = new Set<string>()): Module[] {
-  const src = readFileSync(path, "utf8");
-  const { datas } = readDecls(src);
-  const scope = new Map<string, string>();
-  for (const d of datas) scope.set(d.name, typeName(prefix, d.name));
-  const out: Module[] = [];
-  for (const m of src.matchAll(/^import (\.{1,2}\/\S+\.bend) as ([A-Za-z_]\w*)\s*$/gm)) {
-    const dep = resolve(dirname(path), m[1]);
-    const depPrefix = `${prefix}${m[2]}_`;
-    const sub = modules(dep, depPrefix, seen);
-    for (const d of sub[0].datas) scope.set(`${m[2]}.${d.name}`, typeName(depPrefix, d.name));
-    if (!seen.has(dep + depPrefix)) {
-      seen.add(dep + depPrefix);
-      out.push(...sub);
-    }
-  }
-  return [{ prefix, datas, scope }, ...out];
-}
-
-export function declarations(mods: Module[], defs: Def[], undeclared?: string[]): string {
-  const out: string[] = [...PREAMBLE, ""];
-  const written = new Map<string, string>();
-  for (const { prefix, datas, scope } of mods) {
-    for (const d of datas) {
-      const name = typeName(prefix, d.name);
-      if (!IDENT.test(name)) fail(`type ${d.name}: not a TypeScript identifier`);
-      if (PREAMBLE_TYPES.has(name)) fail(`type ${d.name}: the name of a type bend-emit declares for Base (${[...PREAMBLE_TYPES].join(", ")}); rename it`);
-      // An import is written <alias>_<Type>, which a local type or another
-      // import can spell too; two types of one name do not typecheck.
-      const source = prefix === "" ? `type ${d.name} of the core` : `type ${d.name} imported as ${prefix.slice(0, -1)}`;
-      const prior = written.get(name);
-      if (prior !== undefined) fail(`two types would both be written ${name}: ${prior} and ${source}; rename one`);
-      written.set(name, source);
-      const inner = new Map(scope);
-      for (const p of d.tparams) inner.set("$param:" + p, p);
-      const shape = (c: Ctor) => "{ $: " + JSON.stringify(c.name)
-        + c.fields.map(([f, t]) => `; ${JSON.stringify(f)}: ${tsType(t, inner, `type ${name}`)}`).join("") + " }";
-      if (d.ctors.length === 0) fail(`type ${name}: no constructors, so no value can cross`);
-      const params = d.tparams.length ? `<${d.tparams.join(", ")}>` : "";
-      out.push(`export type ${name}${params} = ${d.ctors.map(shape).join(" | ")};`);
-    }
-  }
-  const main = mods[0].scope;
-  out.push("");
-  const members: string[] = [];
-  for (const f of defs) {
-    // A parameter name is not part of the type contract; one TypeScript cannot
-    // bind is written be$<name>, a prefix no Bend name can spell.
-    let sig: string;
-    try {
-      sig = "(" + f.params.map(([n, t]) => `${bindable(n) ? n : "be$" + n}: ${tsType(t, main, `def ${f.name}`)}`).join(", ")
-        + "): " + tsType(f.ret, main, `def ${f.name}`);
-    } catch (e) {
-      // Asked to (a laws file), leave a def without a TypeScript type out of
-      // the declaration; it stays in the module.
-      if (!undeclared) throw e;
-      undeclared.push(f.name);
-      continue;
-    }
-    if (bindable(f.name)) out.push(`export declare function ${f.name}${sig};`);
-    members.push(`  ${JSON.stringify(f.name)}${sig};`);
-  }
-  // bend-emit's own names start with be$, which no def name can spell here.
-  const held = "be$default";
-  out.push("", `declare const ${held}: {`, ...members, "};", `export default ${held};`, "");
-  return out.join("\n");
-}
-
-// The bend this tool is built and tested against (BEND_VERSION, beside this
-// file's package). Another version is refused, not tried: the module is
-// bend's own output, and this tool rewrites its tags and reads its exports, so
-// a compiler it was never checked against could change either without a word.
-const BEND_VERSION = readFileSync(new URL("../BEND_VERSION", import.meta.url), "utf8").trim();
-
-function checkBend(): void {
-  const run = Bun.spawnSync(["bend", "version"], { stderr: "pipe", stdout: "pipe" });
-  const have = run.exitCode === 0 ? run.stdout.toString().trim() : "";
-  if (have !== `bend ${BEND_VERSION}`) {
-    fail(`needs bend ${BEND_VERSION}; \`bend version\` on PATH says ${have ? `"${have}"` : "nothing (no bend on PATH)"}`);
-  }
-}
+export { checkSource, importsOf, prefixes } from "./book";
 
 // Compile the core with bend's ES-module target and return what it wrote.
-export function bundle(core: string): string {
-  checkBend();
-  const tmp = mkdtempSync(join(tmpdir(), "bend-lib-"));
-  try {
-    const out = join(tmp, "core.mjs");
-    const run = Bun.spawnSync(["bend", core, "-o", out], { stderr: "pipe", stdout: "pipe" });
-    if (run.exitCode !== 0) fail(`bend could not compile ${core}:\n${run.stdout.toString()}${run.stderr.toString()}`);
-    return readFileSync(out, "utf8");
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
+export async function bundle(core: string): Promise<string> {
+  return javascript(await load(core), core);
 }
 
 // bend's module is `export default { name: fn, ... }` and nothing else. A host
@@ -349,12 +54,13 @@ export function bundle(core: string): string {
 // def to `be$<i>`; bend never writes a name starting with `be$`, so they cannot
 // collide. Each def is exported under its own name.
 //
-// bend 2.0.39 writes the statement straight after the closing brace of the
-// module's last function when that function is a lifted closure, as
-// `}export default {` on one line (a def that passes a lambda, such as
-// `l => f(t, l)`, ends the module so). It is put on a line of its own first.
+// bend writes the statement straight after the module's last line of code,
+// with no line break: after the closing brace of a lifted closure, as
+// `}export default {` (a def that passes a lambda, such as `l => f(t, l)`,
+// ends the module so), or after the last `const $$f = ...;` entry that a
+// non-tail call goes through. It is put on a line of its own first.
 export function exportsOf(raw: string, names: string[]): string {
-  const chunk = raw.replace(/^\}export default \{$/m, "}\nexport default {");
+  const chunk = raw.replace(/^(.*[;}])export default \{$/m, "$1\nexport default {");
   const found = chunk.match(/^export /gm) ?? [];
   if (found.length !== 1) fail(`bend's module has ${found.length} exports, not one: ${found.join(", ")}`);
   if (!/^export default \{$/m.test(chunk)) fail("bend's module has no `export default {` of its own");
@@ -371,26 +77,7 @@ export function exportsOf(raw: string, names: string[]): string {
   ].join("\n");
 }
 
-// The export-name prefixes of every .bend file a core reaches, transitively.
-// bend names an imported def by its path relative to the entry module,
-// with "./" dropped, then ":": "../keys/core:" from comp,
-// "generics:" for "./generics.bend". (Through bend 2.0.37 the separator was ".".)
-//
-// A constructor's tag needs no such care: since 2.0.38 bend tags it with its
-// name in the file that declares it ("TooBig", not "generics.TooBig"), which is
-// the name the .d.mts and every host that builds values by hand speak.
-export function importPrefixes(path: string, seen = new Set<string>(), out = new Set<string>(), root = dirname(path)): Set<string> {
-  if (seen.has(path)) return out;
-  seen.add(path);
-  for (const m of readFileSync(path, "utf8").matchAll(/^import (\.{1,2}\/\S+)\.bend as \w+\s*$/gm)) {
-    const dependency = resolve(dirname(path), m[1] + ".bend");
-    out.add(relative(root, dependency).replace(/\\/g, "/").replace(/\.bend$/, "") + ":");
-    importPrefixes(dependency, seen, out, root);
-  }
-  return out;
-}
-
-type Built = { js: string; dts: string; stayed: Stayed[]; kept: Kept[]; peeled: Peeled[]; native: Native[]; skipped: Skipped[]; undeclared: string[] };
+type Built = { js: string; dts: string; eager: Reverted[]; stayed: Stayed[]; kept: Kept[]; peeled: Peeled[]; native: Native[]; skipped: Skipped[]; entered: Entry[]; undeclared: string[] };
 
 // A file that holds laws or lemmas is built from a copy without them (see
 // laws.ts), and there a def with no TypeScript type is left out of the .d.mts
@@ -405,36 +92,28 @@ export async function build(corePath: string, outDir: string): Promise<Built> {
 }
 
 async function buildCore(core: string, outDir: string, lenient: boolean): Promise<Built> {
-  const { defs } = readDecls(readFileSync(core, "utf8"));
-  // bend exports every filled def that is not IO (main is the usual one),
-  // except a def with a template parameter (~rule: bend's .mjs target does not
-  // export it). Of those, the .d.mts declares the defs whose types it can write:
-  // not one with an erased parameter (-A has no runtime position this tool can
-  // vouch for), and not one whose type depends on a value (a type computed by
-  // a def, like Meaning(s), is not a TypeScript type). Those stay in the
-  // module, undeclared, so the export check below still sees them.
-  const lib = defs.filter((d) => !d.ret.startsWith("IO(") && !d.params.some(([n]) => n.startsWith("~")));
-  // A def returning Data or Type computes a type; an imported one is written
-  // under its alias (S.Meaning).
-  const computing = (src: string) => readDecls(src).defs.filter((d) => d.ret === "Data" || d.ret === "Type").map((d) => d.name);
-  const computed = new Set(computing(readFileSync(core, "utf8")));
-  for (const m of readFileSync(core, "utf8").matchAll(/^import (\.{1,2}\/\S+\.bend) as ([A-Za-z_]\w*)\s*$/gm)) {
-    for (const d of computing(readFileSync(resolve(dirname(core), m[1]), "utf8"))) computed.add(`${m[2]}.${d}`);
-  }
-  const esc = (x: string) => x.replace(/\./g, "\\.");
-  const dependent = (t: string) => [...computed].some((c) => new RegExp(`(^|[^\\w.])${esc(c)}\\(`).test(t)) || computed.has(t);
-  const hostable = (d: Def) => !d.erased && !computed.has(d.name) && !dependent(d.ret) && !d.params.some(([, t]) => dependent(t));
+  const loaded = await load(core);
+  // The defs bend's module exports (see book.ts). Of those, the .d.mts
+  // declares the defs whose types it can write: not one returning IO, not one
+  // with an erased parameter, and not one whose type depends on a value. Those
+  // stay in the module, undeclared, so the export check below still sees them.
+  const names = exported(loaded);
+  const compiled = await javascript(loaded, core);
   const undeclared: string[] = [];
-  const dts = declarations(modules(core), lib.filter(hostable), lenient ? undeclared : undefined);
+  const dts = declarations(loaded, core, names, arities(compiled), lenient ? undeclared : undefined);
   // Shape (B), a constructor whose last field is the self-call, becomes a loop
   // (see loops.ts); what stays a JavaScript recursion is reported by main.
   // Base's String.order.go, which every String comparison goes through, gets a
-  // native equivalent first (see intrinsics.ts).
-  const intr = intrinsics(bundle(core));
-  const looped = loopify(lazySelect(intr.js).js);
+  // native equivalent (see intrinsics.ts). Before any of them, each call through
+  // a `$f` entry is written back as a direct call (see entries.ts). A call only
+  // some paths read is moved to those paths (see select.ts, lazy.ts) before the
+  // loops are made, so that a self-call among them becomes a loop step.
+  const ent = entries(compiled);
+  const intr = intrinsics(ent.js);
+  const lazied = lazyArgs(lazySelect(intr.js).js);
+  const looped = loopify(lazied.js);
   const peeled = peel(looped.js);
   const chunk = classify(peeled.js);
-  const names = lib.map((d) => d.name);
   const js = exportsOf(chunk, names);
 
   outDir = resolve(outDir);
@@ -445,22 +124,19 @@ async function buildCore(core: string, outDir: string, lenient: boolean): Promis
   const dtsPath = join(outDir, stem + ".d.mts");
   writeFileSync(jsPath, head + js);
 
-  // The defs read from the source must be the module's exports, exactly.
+  // The defs read from the Book must be the module's exports, exactly. The
+  // module also carries the defs of every .bend file the core reaches; each
+  // is named with its file's namespace, which ends in ":" ("generics:first_big",
+  // "0x<hash>/bytes:n"), and a name of the core's own has none.
   const mod = (await import(jsPath + "?t=" + Date.now())).default as Record<string, unknown>;
-  // The module also carries the defs of every .bend file the core reaches,
-  // directly or through another import; those are theirs. Each is named by
-  // its path relative to the entry module
-  // ("../schema-lib/core:check", or "generics:first_big" for
-  // "./generics.bend"), including transitive imports.
-  const imported = [...importPrefixes(core)];
-  const have = Object.keys(mod).filter((k) => !imported.some((p) => k.startsWith(p))).sort();
+  const have = Object.keys(mod).filter((k) => !k.includes(":")).sort();
   const want = [...names].sort();
   if (have.join() !== want.join()) {
     rmSync(jsPath);
-    fail(`the source's defs and the module's exports differ:\n  source: ${want.join(", ")}\n  module: ${have.join(", ")}`);
+    fail(`the checked core's defs and the module's exports differ:\n  core: ${want.join(", ")}\n  module: ${have.join(", ")}`);
   }
   writeFileSync(dtsPath, head + dts);
-  return { js: jsPath, dts: dtsPath, stayed: looped.stayed, kept: peeled.kept, peeled: peeled.peeled, native: intr.native, skipped: intr.skipped, undeclared };
+  return { js: jsPath, dts: dtsPath, eager: lazied.reverted, stayed: looped.stayed, kept: peeled.kept, peeled: peeled.peeled, native: intr.native, skipped: intr.skipped, entered: ent.kept, undeclared };
 }
 
 if (import.meta.main) {
@@ -472,9 +148,11 @@ if (import.meta.main) {
   try {
     const r = await build(core, out);
     console.log(`wrote ${r.js} and ${r.dts}`);
+    for (const e of r.eager) console.log(`still eager: ${e.name.replace(/^\$|\$$/g, "")} (${e.reason})`);
     for (const d of r.stayed) console.log(`still recursive: ${d.name.replace(/^\$|\$$/g, "")} (${d.reason})`);
     for (const k of r.kept) console.log(`string still sliced: ${k.name.replace(/^\$|\$$/g, "")} (${k.param}: ${k.reason})`);
-    for (const s of r.skipped) console.log(`not made native: ${s.name.replace(/^\$|\$$/g, "")} (${s.reason})`);
+    for (const s of r.skipped) console.log(`not made native: ${s.name.replace(/^\$|\$/g, "")} (${s.reason})`);
+    for (const e of r.entered) console.log(`call kept through an entry: ${e.name.replace(/^\$+/, "")} (${e.reason})`);
     if (r.undeclared.length) console.log(`no TypeScript encoding, left out of the .d.mts: ${r.undeclared.join(", ")}`);
   } catch (e) {
     console.error((e as Error).message);
